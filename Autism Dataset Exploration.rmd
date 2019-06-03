@@ -1,0 +1,293 @@
+---
+title: "Biological Detection of Autism"
+author: "Shivam Tripathi"
+date: "28 May 2019"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+# Need to ignore 2nd row as it contains units only.
+# Read in col names only
+autism.names = read_csv("S1Dataset.csv", n_max = 0) %>% names()
+autism.df = read_csv("S1Dataset.csv", col_names = autism.names, skip = 2)
+autism.df = autism.df[,-26] # Drop Vineland ABC column, since it is not a biological factor
+
+library(rpart)
+```
+
+
+To kick things off, we can try using a simple decision tree using `rpart()` to distinguish the ASD (Autism Spectrum Disorder) and NEU (Neurotypical) groups, and assess it with a confusion matrix.
+
+```{r}
+autism.subset = autism.df %>% 
+  filter(Group %in% c("ASD", "NEU"))
+autism.tree1 = rpart(Group ~ ., data = autism.subset)
+predict1 = predict(autism.tree1, type = "class") # Sufficient to get fitted values out
+# Can also do predict(autism.tree1, autism.subset, type = "class")
+confMatrix1 = table(Actual = autism.subset$Group, Predicted = predict1)
+correct1 = (confMatrix1[1,1] + confMatrix1[2,2]) / nrow(autism.subset)
+confMatrix1
+```
+
+91.19% of people from those two groups are correctly classified.
+
+The dataset makes our simple decision tree classifier look good, because the number of ASD and neurotypical participants are equal. In reality, Autism Spectrum Disorder affects about 1.5% of people, according to [The Changing Epidemiology of Autism Spectrum Disorders](https://www.ncbi.nlm.nih.gov/pubmed/28068486). This time we'll run `rpart()` to build a tree based on population prior probabilities of 0.015 and 0.985. 
+
+```{r}
+autism.tree2 = rpart(Group ~ ., data = autism.subset, parms = list(prior = c(0.015, 0.985)))
+predict2 = predict(autism.tree2, type = "class") # Sufficient to get fitted values out
+confMatrix2 = table(Actual = autism.subset$Group, Predicted = predict2)
+correct2 = (confMatrix2[1,1] + confMatrix2[2,2]) / nrow(autism.subset)
+confMatrix2
+```
+
+91.19% of people from those two groups are correctly classified. Same as before, but no more False Positives - i.e. no NEU are predicted as ASD.
+
+
+Let's say that false negative classifications (missing ASD) are thought to be more important than false positives (suspecting ASD). This time, we'll run `rpart()` with the prior argument, but this time we'll add the loss argument saying that false negatives are 10 times as bad as false positives. 
+
+```{r}
+autism.tree3 = rpart(Group ~ ., data = autism.subset, 
+                     parms = list(prior = c(0.015, 0.985), 
+                                  loss = matrix(c(0, 10, 1, 0), nrow = 2, byrow = TRUE)))
+predict3 = predict(autism.tree3, type = "class") # Sufficient to get fitted values out
+confMatrix3 = table(Actual = autism.subset$Group, Predicted = predict3)
+correct3 = (confMatrix3[1,1] + confMatrix3[2,2]) / nrow(autism.subset)
+confMatrix3
+```
+
+87.42% of people from those two groups are correctly classified. This seems to be a bit lower compared to before, as one extra observation is now incorrectly classified. The loss matrix has made the classification slightly worse.
+
+
+We can use this final tree to predict for the SIB group (referring to the subjects' siblings, all of whom are actually neurotypical). lethat proportion are correctly classified?
+
+```{r}
+autism.siblings = autism.df %>%
+  filter(Group == "SIB")
+predict4 = predict(autism.tree3, autism.siblings, type = "class")
+table(predict4)
+```
+
+87% of siblings, all neurotypical, are correctly classified. 
+
+
+Now, we will use the same dataset, this time using random forests to see if we can beat the previous model's accuracy by aggregating more trees.
+
+```{r}
+autism.names = read_csv("S1Dataset.csv", n_max = 0) %>% names()
+autism.df = read_csv("S1Dataset.csv", col_names = autism.names, skip = 2)
+autism.subset = autism.df %>% filter(Group %in% c("ASD", "NEU"))
+names(autism.subset)<-make.names(names(autism.subset))
+autism.subset = autism.subset %>% select(-Vineland.ABC)
+library(ranger)
+```
+
+
+In order to find the best number of trees for our model, we'll fit random forests with 1, 2, 3 ... 10, 20, 30 ... 90, 100, 200, 300, 400, and 500 trees, repeated 10 times for each value, in order to generate a clearer trend.
+
+```{r}
+sizes = rep(c(seq(1,10), seq(10, 100, 10), seq(100, 500, 100)), 10)
+results1 = sizes %>% map_dbl(~ ranger(factor(Group) ~ ., data = autism.subset, 
+                                      num.trees = .x)$prediction.error)
+
+# Plotting the (out of bag) error rate against number of trees
+library(gridExtra)
+plot1 = qplot(sizes, results1)
+plot2 = qplot(sizes, results1, log = "x", xlab = "size (log scale)")
+grid.arrange(plot1, plot2, ncol = 2)
+```
+
+We see diminishing returns with the number of trees fitted. After about 100 trees, the prediction error seems to asymptote out.
+
+
+With the default number of trees, we'll grow forests with `mtry` = 2, 3, 4, 5, 6, 7, 8, 9. (`mtry` is the number of variables available for splitting at each tree node)
+
+```{r}
+mtrys = rep(seq(2,9), 10)
+results2 = mtrys %>% map_dbl(~ ranger(factor(Group) ~ ., data = autism.subset, 
+                                      mtry = .x)$prediction.error)
+
+# Plotting the (out of bag) error rate against mtry.
+qplot(mtrys, results2)
+```
+
+Our out of bag error rate seems to be (ever so slightly) increasing as the `mtry` parameter increases. Let's see if the relationship shown above is the same if we plot the different levels of `mtry` with our `num.trees` parameter at 100
+
+```{r}
+mtrys = rep(seq(2,9), 10)
+results2 = mtrys %>% map_dbl(~ ranger(factor(Group) ~ ., data = autism.subset, num.trees = 100, 
+                                      mtry = .x)$prediction.error)
+
+# Plotting the (out of bag) error rate against mtry.
+qplot(mtrys, results2)
+```
+So our ideal parameters seem to be `mtry` = 2, and `num.trees` = 100. Let's see how our much better our accuracy is than our decision tree model.
+
+```{r}
+randforest = ranger(factor(Group) ~ ., data = autism.subset, num.trees = 100, mtry = 2)
+randforest
+randforest$confusion.matrix
+```
+So our accuracy is around 94%. Not too bad, but also not much of an improvement.
+
+This time, we'll train A neural network with no hidden layers and just a single output node with softmax activation, using binary crossentropy loss. (Essentially the same as a logistic regression model). You might ask: "Shiv, why didn't you just use a logistical regression model?". Good question.
+
+```{r}
+library(keras)
+# Need to ignore 2nd row as it contains units only.
+# Read in col names only
+
+autism.names = read_csv("S1Dataset.csv", n_max = 0) %>% names()
+autism.df = read_csv("S1Dataset.csv", col_names = autism.names, skip = 2)
+autism.df = autism.df[,-26] # Drop Vineland ABC column
+
+autism.subset = autism.df %>% filter(Group %in% c('NEU', 'ASD'))
+autism.sib = autism.df %>% filter(Group == "SIB")
+
+response = ifelse(autism.subset$Group == "ASD", 1, 0)
+
+preds = autism.subset %>% select(-Group) %>% as.matrix() %>% scale()
+preds.sib = autism.sib %>% select(-Group) %>% as.matrix() %>% 
+  scale(center = attr(preds, "scaled:center"), scale = attr(preds, "scaled:scale"))
+responseSib = ifelse(autism.sib$Group == "ASD", 1, 0)
+```
+
+
+```{r}
+model1 = keras_model_sequential()
+model1 %>%
+  layer_dense(units = 1, activation = "sigmoid", input_shape = dim(preds)[[2]])
+summary(model1)
+```
+
+```{r}
+model1 %>% compile(
+  optimizer = optimizer_sgd(),
+  loss = c("binary_crossentropy"),
+  metrics = ("accuracy")
+)
+
+history = model1 %>% fit(
+  preds, response,
+  epochs = 200,
+  validation_split = 0.2,
+  verbose = 0
+)
+
+plot(history)
+```
+
+
+Calculating the in-sample accuracy
+
+```{r}
+score1 = model1 %>% evaluate(
+  preds, response, verbose = 0
+)
+score1
+```
+
+
+Calculating the out-of-sample accuracy
+
+```{r}
+predictions1 = model1 %>% predict_classes(preds.sib)
+acc1out = sum(predictions1) / nrow(autism.sib)
+score1out = score1 = model1 %>% evaluate(
+  preds.sib, responseSib, verbose = 0
+)
+score1out
+```
+
+
+Now we will try and create a model with no hidden layers and just a single output node with linear activation and MSE loss. (this is the same as LDA). 
+
+```{r}
+# response2 = ifelse(autism.subset$Group == "ASD", 1, -1)
+model2 = keras_model_sequential()
+model2 %>%
+  layer_dense(units = 1, activation = "linear", input_shape = dim(preds)[[2]])
+summary(model2)
+```
+
+```{r}
+model2 %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = c("mse")
+)
+
+history = model2 %>% fit(
+  preds, response,
+  epochs = 200,
+  validation_split = 0.2,
+  verbose = 0
+)
+
+plot(history)
+```
+
+```{r}
+score2 = model2 %>% evaluate(
+  preds, response, verbose = 0
+)
+```
+
+```{r}
+predictions2in = model2 %>% predict(preds)
+predClasses2in = ifelse(predictions2in <= 0.5, "NEU", "ASD")
+acc2in = sum(predClasses2in == autism.subset$Group) / nrow(autism.subset)
+
+predictions2out = model2 %>% predict(preds.sib)
+predClasses2out = ifelse(predictions2out <= 0.5, "NEU", "ASD")
+acc2out = sum(predClasses2out == "NEU") / nrow(autism.sib)
+```
+
+
+```{r}
+table(autism.subset$Group, predClasses2in)
+```
+
+
+```{r}
+table(autism.sib$Group, predClasses2out)
+```
+
+```{r}
+model3 = keras_model_sequential()
+model3 %>%
+  layer_dense(units = 8, activation = "relu", input_shape = dim(preds)[[2]]) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+summary(model3)
+```
+
+```{r}
+model3 %>% compile(
+  optimizer = optimizer_sgd(),
+  loss = c("binary_crossentropy"),
+  metrics = ("accuracy")
+)
+
+history = model3 %>% fit(
+  preds, response,
+  epochs = 500,
+  validation_split = 0.2,
+  verbose = 0
+)
+
+plot(history)
+```
+
+```{r}
+score3 = model3 %>% evaluate(
+  preds, response, verbose = 0
+)
+score3
+```
+
+```{r}
+score3out = model3 %>% evaluate(
+  preds.sib, responseSib, verbose = 0
+)
+score3out
+```
